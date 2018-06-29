@@ -1,10 +1,11 @@
 # Vault on Google Kubernetes Engine
 
-This tutorial walks you through provisioning a multi-node [HashiCorp Vault](https://www.vaultproject.io/intro/index.html) cluster on [Google Kubernetes Engine](https://cloud.google.com/kubernetes-engine).
+This tutorial walks you through provisioning a multi-node [HashiCorp Vault](https://www.vaultproject.io/intro/index.html) cluster on [Google Kubernetes Engine](https://cloud.google.com/kubernetes-engine) with support for automated SSL certificate provisioning
 
 ## Cluster Features
 
 * High Availability - The Vault cluster will be provisioned in [multi-server mode](https://www.vaultproject.io/docs/concepts/ha.html) for high availability.
+* Vault sits behind an ingress allowing automated Lets Encrypt certificate provisioning with [kube-lego](https://github.com/jetstack/kube-lego) or [cert-manager](https://github.com/jetstack/cert-manager).
 * Google Cloud Storage Storage Backend - Vault's data is persisted in [Google Cloud Storage](https://cloud.google.com/storage).
 * Production Hardening - Vault is configured and deployed based on the guidance found in the [production hardening](https://www.vaultproject.io/guides/operations/production.html) guide.
 * Auto Initialization and Unsealing - Vault is automatically initialized and unsealed at runtime. Keys are encrypted using [Cloud KMS](https://cloud.google.com/kms) and stored on [Google Cloud Storage](https://cloud.google.com/storage).
@@ -154,10 +155,10 @@ gcloud container clusters create vault \
 
 In this section you will create a public IP address that will be used to expose the Vault server to external clients.
 
-Create the `vault` compute address:
+Create the `vault-ingress-ip` compute address:
 
 ```
-gcloud compute addresses create vault \
+gcloud compute addresses create vault-ingress-ip \
   --region ${COMPUTE_REGION} \
   --project ${PROJECT_ID}
 ```
@@ -165,11 +166,26 @@ gcloud compute addresses create vault \
 Store the `vault` compute address in an environment variable:
 
 ```
-VAULT_LOAD_BALANCER_IP=$(gcloud compute addresses describe vault \
+VAULT_INGRESS_IP=$(gcloud compute addresses describe vault \
   --region ${COMPUTE_REGION} \
   --project ${PROJECT_ID} \
   --format='value(address)')
 ```
+
+### Update DNS
+
+Point a domain or subdomain of your choosing at the `VAULT_INGRESS_IP`. This is beyond the scope of this guide.
+Set the following variable for later use
+
+```
+VAULT_DOMAIN=""
+```
+
+### Configure automated certificate provisioning
+
+Deploy either kube-lego (deprecated) or cert-manager https://hub.kubeapps.com/charts/stable/cert-manager into your kubernetes cluster
+
+TODO: take note of the cert-manager annotations https://cert-manager.readthedocs.io/en/latest/reference/ingress-shim.html as that will need adding to the ingress
 
 ### Generate TLS Certificates
 
@@ -188,7 +204,7 @@ cfssl gencert \
   -ca=ca.pem \
   -ca-key=ca-key.pem \
   -config=ca-config.json \
-  -hostname="vault,vault.default.svc.cluster.local,localhost,127.0.0.1,${VAULT_LOAD_BALANCER_IP}" \
+  -hostname="vault,vault.default.svc.cluster.local,localhost,127.0.0.1" \
   -profile=default \
   vault-csr.json | cfssljson -bare vault
 ```
@@ -216,7 +232,7 @@ Create the `vault` configmap:
 
 ```
 kubectl create configmap vault \
-  --from-literal api-addr=https://${VAULT_LOAD_BALANCER_IP}:8200 \
+  --from-literal api-addr=https://${VAULT_INGRESS_IP} \
   --from-literal gcs-bucket-name=${GCS_BUCKET_NAME} \
   --from-literal kms-key-id=${KMS_KEY_ID}
 ```
@@ -276,41 +292,48 @@ A [readiness probe](https://kubernetes.io/docs/tasks/configure-pod-container/con
 
 In this section you will expose the Vault cluster using an external network load balancer.
 
-Generate the `vault` service configuration:
+Generate the `vault` ingress configuration:
 
 ```
-cat > vault-load-balancer.yaml <<EOF
-apiVersion: v1
-kind: Service
+cat > vault-ingress.yaml <<EOF
+apiVersion: extensions/v1beta1
+kind: Ingress
 metadata:
-  name: vault-load-balancer
+  name: vault-ingress
+  annotations:
+    kubernetes.io/tls-acme: "true"
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.global-static-ip-name: "vault-ingress-ip"
 spec:
-  type: LoadBalancer
-  loadBalancerIP: ${VAULT_LOAD_BALANCER_IP}
-  ports:
-    - name: http
-      port: 8200
-    - name: server
-      port: 8201
-  selector:
-    app: vault
+  rules:
+  - host: "${VAULT_DOMAIN}"
+    http:
+      paths:
+      - path: /*
+        backend:
+          serviceName: vault
+          servicePort: 8200
+  tls:
+    - hosts:
+      - "${VAULT_DOMAIN}"
+      secretName: "vault-ingress-tls"
 EOF
 ```
 
-Create the `vault-load-balancer` service:
+Create the `vault-ingress`:
 
 ```
-kubectl apply -f vault-load-balancer.yaml
+kubectl apply -f vault-ingress.yaml
 ```
 
-Wait until the `EXTERNAL-IP` is populated:
+Wait until the `ADDRESS` is populated with the IP we reserved earlier:
 
 ```
-kubectl get svc vault-load-balancer
+kubectl get ing vault-ingress
 ```
 ```
-NAME                  TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)
-vault-load-balancer   LoadBalancer   XX.XX.XXX.XXX   <pending>     8200:31805/TCP,8201:32754/TCP
+NAME            HOSTS                           ADDRESS         PORTS     AGE
+vault-ingress   vault-prod.basekit.technology                   80, 443   1m
 ```
 
 ### Smoke Tests
@@ -333,7 +356,7 @@ Seal Type              shamir
 Sealed                 false
 Total Shares           1
 Threshold              1
-Version                0.10.0
+Version                0.10.3
 Cluster Name           vault-cluster-06e44047
 Cluster ID             05d31509-8c61-c1a9-3289-0003513b26a5
 HA Enabled             true
